@@ -90,28 +90,52 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     } elseif (strtotime($new_date) < strtotime(date('Y-m-d'))) {
                         $errors[] = 'New appointment date cannot be in the past.';
                     } else {
-                        // Check for conflicts: only Pending/Confirmed block the slot
-                        $stmt = $pdo->prepare("
-                            SELECT id FROM appointments
-                            WHERE doctor_id = ?
-                              AND appointment_date = ?
-                              AND appointment_time = ?
-                              AND LOWER(status) IN ('pending', 'confirmed')
-                              AND id != ?
-                        ");
-                        $stmt->execute([$appointment['doctor_id'], $new_date, $new_time, $appointment_id]);
+                        // Ensure the doctor is working on the selected day
+                        $errorCountBeforeAvailability = count($errors);
+                        try {
+                            $doctorStmt = $pdo->prepare("SELECT working_days FROM doctors WHERE id = ?");
+                            $doctorStmt->execute([$appointment['doctor_id']]);
+                            $doctor = $doctorStmt->fetch();
 
-                        if ($stmt->fetch()) {
-                            $errors[] = 'The selected time slot is already booked. Please choose another time.';
-                        } else {
-                            // Update to new datetime and mark as Pending
+                            if (!$doctor) {
+                                $errors[] = 'Unable to verify doctor availability. Please try again.';
+                            } else {
+                                $workingDays = trim((string)($doctor['working_days'] ?? ''));
+                                if ($workingDays !== '') {
+                                    $dayName = date('l', strtotime($new_date));
+                                    if (!isDoctorAvailableOnDay($workingDays, $dayName)) {
+                                        $errors[] = 'The selected date is outside the doctor\'s working days. Please choose another date.';
+                                    }
+                                }
+                            }
+                        } catch (PDOException $e) {
+                            $errors[] = 'Unable to verify doctor availability. Please try again.';
+                        }
+
+                        if ($errorCountBeforeAvailability === count($errors)) {
+                            // Check for conflicts: only Pending/Confirmed block the slot
                             $stmt = $pdo->prepare("
-                                UPDATE appointments
-                                SET appointment_date = ?, appointment_time = ?, status = 'Pending', updated_at = NOW()
-                                WHERE id = ?
+                                SELECT id FROM appointments
+                                WHERE doctor_id = ?
+                                  AND appointment_date = ?
+                                  AND appointment_time = ?
+                                  AND LOWER(status) IN ('pending', 'confirmed')
+                                  AND id != ?
                             ");
-                            $stmt->execute([$new_date, $new_time, $appointment_id]);
-                            $success_message = 'Appointment rescheduled successfully.';
+                            $stmt->execute([$appointment['doctor_id'], $new_date, $new_time, $appointment_id]);
+
+                            if ($stmt->fetch()) {
+                                $errors[] = 'The selected time slot is already booked. Please choose another time.';
+                            } else {
+                                // Update to new datetime and mark as Pending
+                                $stmt = $pdo->prepare("
+                                    UPDATE appointments
+                                    SET appointment_date = ?, appointment_time = ?, status = 'Pending', updated_at = NOW()
+                                    WHERE id = ?
+                                ");
+                                $stmt->execute([$new_date, $new_time, $appointment_id]);
+                                $success_message = 'Appointment rescheduled successfully.';
+                            }
                         }
                     }
                 }
@@ -443,6 +467,9 @@ $csrf_token = generateCSRFToken();
                     <?php foreach ($upcoming_appointments as $appointment):
                         $statusText = canon_status_text($appointment['status'] ?? '');
                         $statusClass = status_class($appointment['status'] ?? '');
+                        $workingDaysRaw = parseWorkingDays($appointment['working_days'] ?? '');
+                        $workingDaysArray = array_values(array_filter($workingDaysRaw, 'strlen'));
+                        $workingHoursValue = trim((string)($appointment['working_hours'] ?? ''));
                     ?>
                         <div class="card hospital-card appointment-card upcoming">
                             <div class="card-body">
@@ -463,7 +490,15 @@ $csrf_token = generateCSRFToken();
                                 <?php endif; ?>
 
                                 <div class="appointment-actions">
-                                    <button class="btn btn-warning btn-sm" onclick="openRescheduleModal(<?php echo (int)$appointment['id']; ?>, '<?php echo $appointment['appointment_date']; ?>', '<?php echo $appointment['appointment_time']; ?>')">
+                                    <button
+                                        class="btn btn-warning btn-sm js-reschedule"
+                                        data-appointment-id="<?php echo (int)$appointment['id']; ?>"
+                                        data-current-date="<?php echo htmlspecialchars($appointment['appointment_date'], ENT_QUOTES, 'UTF-8'); ?>"
+                                        data-current-time="<?php echo htmlspecialchars($appointment['appointment_time'], ENT_QUOTES, 'UTF-8'); ?>"
+                                        data-working-days="<?php echo htmlspecialchars(json_encode($workingDaysArray), ENT_QUOTES, 'UTF-8'); ?>"
+                                        data-working-hours="<?php echo htmlspecialchars($workingHoursValue, ENT_QUOTES, 'UTF-8'); ?>"
+                                        type="button"
+                                    >
                                         <i class="fas fa-edit me-1"></i>Reschedule
                                     </button>
                                     <button class="btn btn-danger btn-sm" onclick="cancelAppointment(<?php echo (int)$appointment['id']; ?>)">
@@ -578,9 +613,17 @@ $csrf_token = generateCSRFToken();
                         <input type="hidden" name="action" value="reschedule">
                         <input type="hidden" name="appointment_id" id="reschedule_appointment_id">
 
+                        <div class="alert alert-info py-2 px-3 small" id="reschedule_availability_notice" role="alert">
+                            <div class="fw-semibold mb-1"><i class="fas fa-calendar-check me-2"></i>Doctor Availability</div>
+                            <div>Working days: <span class="fw-semibold" id="reschedule_working_days">Not specified</span></div>
+                            <div>Working hours: <span class="fw-semibold" id="reschedule_working_hours">Not specified</span></div>
+                            <div class="mt-2 text-danger d-none" id="reschedule_date_warning"></div>
+                        </div>
+
                         <div class="mb-3">
                             <label for="new_date" class="form-label">New Date</label>
                             <input type="date" class="form-control" name="new_date" id="new_date" min="<?php echo date('Y-m-d'); ?>" required>
+                            <div class="form-text" id="reschedule_date_help"></div>
                         </div>
                         <div class="mb-3">
                             <label for="new_time" class="form-label">New Time</label>
@@ -717,13 +760,154 @@ $csrf_token = generateCSRFToken();
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        function openRescheduleModal(appointmentId, currentDate, currentTime) {
-            document.getElementById('reschedule_appointment_id').value = appointmentId;
-            document.getElementById('new_date').value = currentDate;
-            document.getElementById('new_time').value = currentTime;
-            const modal = new bootstrap.Modal(document.getElementById('rescheduleModal'));
-            modal.show();
+        const rescheduleModalEl = document.getElementById('rescheduleModal');
+        const rescheduleAppointmentIdInput = document.getElementById('reschedule_appointment_id');
+        const rescheduleDateInput = document.getElementById('new_date');
+        const rescheduleTimeInput = document.getElementById('new_time');
+        const rescheduleWorkingDaysDisplay = document.getElementById('reschedule_working_days');
+        const rescheduleWorkingHoursDisplay = document.getElementById('reschedule_working_hours');
+        const rescheduleDateWarning = document.getElementById('reschedule_date_warning');
+        const rescheduleDateHelp = document.getElementById('reschedule_date_help');
+        let rescheduleWorkingDays = [];
+
+        function getDayNameFromDateString(dateStr) {
+            if (!dateStr) {
+                return '';
+            }
+            const parts = dateStr.split('-');
+            if (parts.length !== 3) {
+                return '';
+            }
+            const year = parseInt(parts[0], 10);
+            const month = parseInt(parts[1], 10);
+            const day = parseInt(parts[2], 10);
+            if (Number.isNaN(year) || Number.isNaN(month) || Number.isNaN(day)) {
+                return '';
+            }
+            const date = new Date(Date.UTC(year, month - 1, day));
+            const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+            return dayNames[date.getUTCDay()] || '';
         }
+
+        function resetDateValidationState() {
+            if (!rescheduleDateInput) {
+                return;
+            }
+            rescheduleDateInput.setCustomValidity('');
+            rescheduleDateInput.classList.remove('is-invalid');
+            if (rescheduleDateWarning) {
+                rescheduleDateWarning.textContent = '';
+                rescheduleDateWarning.classList.add('d-none');
+            }
+        }
+
+        function validateRescheduleDate() {
+            if (!rescheduleDateInput) {
+                return;
+            }
+
+            resetDateValidationState();
+
+            const selectedValue = rescheduleDateInput.value;
+            if (!selectedValue) {
+                return;
+            }
+
+            const dayName = getDayNameFromDateString(selectedValue);
+            if (!dayName) {
+                rescheduleDateInput.setCustomValidity('Please select a valid date.');
+                rescheduleDateInput.classList.add('is-invalid');
+                if (rescheduleDateWarning) {
+                    rescheduleDateWarning.textContent = 'Please select a valid date.';
+                    rescheduleDateWarning.classList.remove('d-none');
+                }
+                return;
+            }
+
+            if (Array.isArray(rescheduleWorkingDays) && rescheduleWorkingDays.length && !rescheduleWorkingDays.includes(dayName)) {
+                rescheduleDateInput.setCustomValidity('Selected date is outside the doctor\'s working days.');
+                rescheduleDateInput.classList.add('is-invalid');
+                if (rescheduleDateWarning) {
+                    rescheduleDateWarning.textContent = 'Please choose a date on: ' + rescheduleWorkingDays.join(', ');
+                    rescheduleDateWarning.classList.remove('d-none');
+                }
+            }
+        }
+
+        function openRescheduleModalFromButton(button) {
+            if (!button) {
+                return;
+            }
+
+            const appointmentId = button.dataset.appointmentId || '';
+            const currentDate = button.dataset.currentDate || '';
+            const currentTime = button.dataset.currentTime || '';
+            const workingHours = button.dataset.workingHours || '';
+
+            let workingDays = [];
+            if (button.dataset.workingDays) {
+                try {
+                    const parsed = JSON.parse(button.dataset.workingDays);
+                    if (Array.isArray(parsed)) {
+                        workingDays = parsed;
+                    }
+                } catch (error) {
+                    workingDays = [];
+                }
+            }
+
+            rescheduleWorkingDays = Array.isArray(workingDays)
+                ? workingDays.map(function (day) { return day.trim(); }).filter(function (day) { return day.length > 0; })
+                : [];
+
+            if (rescheduleAppointmentIdInput) {
+                rescheduleAppointmentIdInput.value = appointmentId;
+            }
+
+            if (rescheduleDateInput) {
+                rescheduleDateInput.value = currentDate || '';
+            }
+
+            if (rescheduleTimeInput) {
+                rescheduleTimeInput.value = currentTime || '';
+            }
+
+            if (rescheduleWorkingDaysDisplay) {
+                rescheduleWorkingDaysDisplay.textContent = rescheduleWorkingDays.length
+                    ? rescheduleWorkingDays.join(', ')
+                    : 'Not specified';
+            }
+
+            if (rescheduleWorkingHoursDisplay) {
+                rescheduleWorkingHoursDisplay.textContent = workingHours ? workingHours : 'Not specified';
+            }
+
+            if (rescheduleDateHelp) {
+                rescheduleDateHelp.textContent = rescheduleWorkingDays.length
+                    ? 'Available days: ' + rescheduleWorkingDays.join(', ')
+                    : 'Doctor availability is not specified.';
+            }
+
+            resetDateValidationState();
+            validateRescheduleDate();
+
+            if (rescheduleModalEl) {
+                const modal = bootstrap.Modal.getOrCreateInstance(rescheduleModalEl);
+                modal.show();
+            }
+        }
+
+        document.querySelectorAll('.js-reschedule').forEach(function (button) {
+            button.addEventListener('click', function () {
+                openRescheduleModalFromButton(button);
+            });
+        });
+
+        if (rescheduleDateInput) {
+            rescheduleDateInput.addEventListener('change', validateRescheduleDate);
+            rescheduleDateInput.addEventListener('input', validateRescheduleDate);
+        }
+
         function cancelAppointment(appointmentId) {
             document.getElementById('cancel_appointment_id').value = appointmentId;
             const modal = new bootstrap.Modal(document.getElementById('cancelModal'));
