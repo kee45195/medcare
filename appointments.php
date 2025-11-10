@@ -90,28 +90,52 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     } elseif (strtotime($new_date) < strtotime(date('Y-m-d'))) {
                         $errors[] = 'New appointment date cannot be in the past.';
                     } else {
-                        // Check for conflicts: only Pending/Confirmed block the slot
-                        $stmt = $pdo->prepare("
-                            SELECT id FROM appointments
-                            WHERE doctor_id = ?
-                              AND appointment_date = ?
-                              AND appointment_time = ?
-                              AND LOWER(status) IN ('pending', 'confirmed')
-                              AND id != ?
-                        ");
-                        $stmt->execute([$appointment['doctor_id'], $new_date, $new_time, $appointment_id]);
+                        // Ensure the doctor is working on the selected day
+                        $errorCountBeforeAvailability = count($errors);
+                        try {
+                            $doctorStmt = $pdo->prepare("SELECT working_days FROM doctors WHERE id = ?");
+                            $doctorStmt->execute([$appointment['doctor_id']]);
+                            $doctor = $doctorStmt->fetch();
 
-                        if ($stmt->fetch()) {
-                            $errors[] = 'The selected time slot is already booked. Please choose another time.';
-                        } else {
-                            // Update to new datetime and mark as Pending
+                            if (!$doctor) {
+                                $errors[] = 'Unable to verify doctor availability. Please try again.';
+                            } else {
+                                $workingDays = trim((string)($doctor['working_days'] ?? ''));
+                                if ($workingDays !== '') {
+                                    $dayName = date('l', strtotime($new_date));
+                                    if (!isDoctorAvailableOnDay($workingDays, $dayName)) {
+                                        $errors[] = 'The selected date is outside the doctor\'s working days. Please choose another date.';
+                                    }
+                                }
+                            }
+                        } catch (PDOException $e) {
+                            $errors[] = 'Unable to verify doctor availability. Please try again.';
+                        }
+
+                        if ($errorCountBeforeAvailability === count($errors)) {
+                            // Check for conflicts: only Pending/Confirmed block the slot
                             $stmt = $pdo->prepare("
-                                UPDATE appointments
-                                SET appointment_date = ?, appointment_time = ?, status = 'Pending', updated_at = NOW()
-                                WHERE id = ?
+                                SELECT id FROM appointments
+                                WHERE doctor_id = ?
+                                  AND appointment_date = ?
+                                  AND appointment_time = ?
+                                  AND LOWER(status) IN ('pending', 'confirmed')
+                                  AND id != ?
                             ");
-                            $stmt->execute([$new_date, $new_time, $appointment_id]);
-                            $success_message = 'Appointment rescheduled successfully.';
+                            $stmt->execute([$appointment['doctor_id'], $new_date, $new_time, $appointment_id]);
+
+                            if ($stmt->fetch()) {
+                                $errors[] = 'The selected time slot is already booked. Please choose another time.';
+                            } else {
+                                // Update to new datetime and mark as Pending
+                                $stmt = $pdo->prepare("
+                                    UPDATE appointments
+                                    SET appointment_date = ?, appointment_time = ?, status = 'Pending', updated_at = NOW()
+                                    WHERE id = ?
+                                ");
+                                $stmt->execute([$new_date, $new_time, $appointment_id]);
+                                $success_message = 'Appointment rescheduled successfully.';
+                            }
                         }
                     }
                 }
